@@ -1,0 +1,8 @@
+{
+  "company": {
+    "name": "Your Company Co., Ltd.",
+    "address": ["123 Example Street", "District, Province 10000", "Thailand"],
+    "phone": "+66-2-xxx-xxxx",
+    "taxId": "0-0000-00000-00-0"
+  }
+}
