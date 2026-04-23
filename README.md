@@ -1,12 +1,27 @@
-# FORGE ⚒️ — Quotation Generator
+# FORGE ⚒️ — Backend Dev Oracle
 
-> Backend Dev Oracle — first specialist under [QuillBrain 🪶](https://github.com/brightverse-solution/quill-brain-oracle).
+> First specialist under [QuillBrain 🪶](https://github.com/brightverse-solution/quill-brain-oracle).
+> Specialty: backend systems, CLI tools, APIs, data pipelines (TypeScript + Bun).
 >
-> CLI tool: turn a CSV of line items into a customer-ready Excel quotation with VAT 7% (THB).
+> See [`CLAUDE.md`](CLAUDE.md) for full identity and principles.
 
 ---
 
-## Install
+## Capabilities
+
+| Tool | Version | Shipped | What it does |
+|---|---|---|---|
+| [Quotation Generator](#quotation-generator) | v1 | 2026-04-23 | CSV → Excel quotation with VAT 7% (THB) |
+
+*(New tools are added to this table as they ship. Each row links to its section below.)*
+
+---
+
+## Quotation Generator
+
+CLI tool: turn a CSV of line items into a customer-ready Excel quotation with VAT 7% (THB).
+
+### Install
 
 Requires [Bun](https://bun.com) `>= 1.1.0`.
 
@@ -16,7 +31,7 @@ cd forge-oracle
 bun install
 ```
 
-## Configure
+### Configure
 
 Copy the template and fill in your company details:
 
@@ -41,7 +56,7 @@ Shape:
 
 `phone` and `taxId` are optional; `name` and `address` (non-empty array) are required.
 
-## Use
+### Use
 
 ```bash
 # basic
@@ -59,7 +74,7 @@ bun run gen-quote input.csv --config /path/to/config.json
 
 Default output filename: `quote-Q-YYYYMMDD-NNN.xlsx` — e.g. `quote-Q-20260423-001.xlsx`.
 
-### Input CSV shape
+#### Input CSV shape
 
 UTF-8, with a header row. Columns: `product`, `quantity`, `price`.
 
@@ -76,7 +91,7 @@ Consulting (hours),8,2500.00
 
 Headers are case-insensitive. Quoted fields are supported (`"Widget, Deluxe"` stays a single product name).
 
-### Output
+#### Output
 
 An `.xlsx` file with:
 
@@ -87,13 +102,13 @@ An `.xlsx` file with:
 
 Example output: [`examples/quote-sample.xlsx`](examples/quote-sample.xlsx) — generated from [`examples/input.csv`](examples/input.csv).
 
-### Quote numbering
+#### Quote numbering
 
 `Q-YYYYMMDD-NNN` — a per-day counter. First quote of each day starts at `001`, counter resets at Bangkok midnight.
 
 State is persisted at `~/.forge-oracle/quote-counter.json`. Override with `--counter-path <path>` (useful for testing).
 
-## Tests
+#### Tests
 
 ```bash
 bun test            # unit + round-trip tests
@@ -108,7 +123,7 @@ Coverage includes:
 - Config loading (valid/invalid JSON, missing fields)
 - XLSX round-trip (write → read → values match)
 
-## Project layout
+#### Source layout
 
 ```
 src/
@@ -125,10 +140,10 @@ examples/
 config.example.json
 ```
 
-## Non-goals (v1)
+#### Non-goals (v1)
 
 No PDF output, no multi-currency, no tax-exempt customers, no discount rows, no email sending, no web UI. These are v2 candidates if and when they're needed.
 
 ---
 
-*Built by [FORGE Oracle](CLAUDE.md) — Heat. Shape. Temper.*
+*Forged by [FORGE Oracle ⚒️](CLAUDE.md) — Heat. Shape. Temper.*
