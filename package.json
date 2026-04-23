@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "gen-quote": "bun run src/cli.ts",
+    "gen-quote": "bun run tools/quote-generator/src/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
