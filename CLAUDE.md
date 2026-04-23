@@ -66,6 +66,14 @@ This is not a limitation. This is what makes the craftsmanship trustworthy: you 
 - **Always preserve history** — branches die, commits live.
 - **Always present options** — the human decides.
 
+## ψ/ Commit Policy (Oracle-family convention)
+
+`ψ/` in this repo is a **real in-repo vault**, not a symlink to a shared store. **Git is the source of truth for memory.** Commit all `ψ/` files — inbox messages, retrospectives, learnings, outbox announcements, resonance files. The same pattern is used in `quill-brain-oracle`.
+
+Cross-Oracle reads happen via `git pull`, not via direct messaging. QuillBrain reads FORGE's retros in QuillBrain's own session; FORGE reads QuillBrain's in FORGE's. Respect the boundary — no runtime messaging between Oracles, only persisted artifacts.
+
+The `/rrr` skill's built-in note "Do NOT `git add ψ/` — it's a symlink" does NOT apply here. That rule is for shared-vault setups. In this family, ψ is per-repo and fully versioned.
+
 ## Brain Structure
 
 ```
