@@ -1,0 +1,1121 @@
+// =============================================================================
+// Soraphop Global — Prisma Schema v1
+// -----------------------------------------------------------------------------
+// FORGE Oracle ⚒️ · 2026-04-27 · per QB work-order soraphop-structure-week-0
+// SRS v3.6 + Meeting #1 (2026-04-24) refinements applied
+//
+// Design contract (binding):
+// - Forward-compatible for 14 weeks; Phase 2 ships WITHOUT breaking migrations
+// - Hexagonal architecture: schema = source of truth, repositories are plugins
+// - Every financial-touching write emits AuditLog (logic in service layer,
+//   not DB triggers — keeps the sink swappable per addendum §1.1)
+// - Soft delete (`deleted_at`) ONLY where FK dependents may outlive the row
+// - cuid() everywhere — collision-safe + sortable + URL-safe
+// - High-cardinality enums (country/currency) stored as String + zod-validated
+// - Low-cardinality fixed sets stored as Prisma enums (no surprise migrations)
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// SECTION 0 — Auth.js v5 standard tables (Auth.js owns shape; do not extend)
+// =============================================================================
+// Auth.js requires these exact field names. Custom user data lives on `User`.
+// Provider lookups are hot — index on (provider, providerAccountId).
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expires])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// =============================================================================
+// SECTION 1 — Identity, Companies, Wallets
+// =============================================================================
+
+enum ActorType {
+  B2C
+  B2B
+  ADMIN
+  SUPER_ADMIN
+  SUPPLIER
+  QC_LOGISTICS
+}
+
+// Locked at row creation. Affects which portal logs in, which RBAC role
+// applies, and which payment methods are available. Distinct from `roles[]`
+// (WARD's RBAC) — a user can hold multiple roles inside the same actor type.
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  PENDING_B2B_APPROVAL
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  emailVerified DateTime?
+  passwordHash  String? // null when only OAuth providers used
+  name          String?
+  phone         String?
+  preferredLang String     @default("th") // ISO 639-1; zod-validated to {th,en,zh}
+  actorType     ActorType
+  status        UserStatus @default(PENDING_VERIFICATION)
+
+  // RBAC: WARD owns the role/permission tables (B3). Reference by id from
+  // platform/auth — repository layer here exposes only the join.
+  roles UserRole[]
+
+  twoFactorSecret       TwoFactorSecret?
+  company               Company?
+  wallet                Wallet?
+  orders                Order[]
+  quotationsAsRequester Quotation[]            @relation("QuotationRequester")
+  auditEvents           AuditLog[]             @relation("AuditActor")
+  approvalsRequested    AdminApproval[]        @relation("ApprovalSubject")
+  approvalsDecided      AdminApproval[]        @relation("ApprovalDecider")
+  notifications         NotificationDelivery[]
+  sessions              Session[]
+  accounts              Account[]
+  specialRequests       SpecialRequest[]       @relation("SpecialRequestRequester")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete: orders + audit refer back
+
+  @@index([actorType, status])
+  @@index([deletedAt])
+}
+
+// B2B-only. 1:1 with User where User.actorType = B2B.
+// Documents (registration cert, VAT cert) stored via BlobStorageAdapter;
+// schema holds only blob keys, not the bytes.
+
+model Company {
+  id                 String  @id @default(cuid())
+  userId             String  @unique
+  legalName          String
+  taxId              String  @unique
+  registrationNumber String?
+  countryCode        String  @default("TH") // ISO 3166-1 alpha-2; zod-validated
+  addressLine1       String
+  addressLine2       String?
+  city               String
+  province           String?
+  postalCode         String
+  contactPersonName  String
+  contactPersonRole  String?
+  contactPhone       String
+
+  // Document blob keys — actual files in S3-compatible bucket via BlobStorageAdapter
+  registrationCertKey String?
+  vatCertKey          String?
+  bankBookKey         String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([taxId])
+}
+
+// Currency stored as ISO 4217 string + zod-validated. Default THB.
+// Balance is derived: SUM(WalletTransaction.amount). Stored snapshot kept
+// for fast reads; reconciler job verifies consistency nightly.
+
+model Wallet {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  currency        String   @default("THB")
+  balanceSnapshot Decimal  @default(0) @db.Decimal(18, 2)
+  snapshotAt      DateTime @default(now())
+
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum WalletTxnType {
+  TOP_UP // UC-B05 — buyer adds funds
+  PAYMENT_HOLD // installment locked at quotation confirm
+  PAYMENT_RELEASE // admin verifies installment
+  PAYMENT_REFUND
+  CLAIM_DEDUCTION // Phase 2 UC-A12
+  BOX_DEDUCTION // Phase 2 UC-A12
+  ADJUSTMENT // manual admin correction (audit-logged)
+}
+
+model WalletTransaction {
+  id          String        @id @default(cuid())
+  walletId    String
+  type        WalletTxnType
+  amount      Decimal       @db.Decimal(18, 2) // signed: negative = debit
+  currency    String
+  refType     String? // e.g., "Payment", "Order" — polymorphic ref
+  refId       String?
+  bankTxnId   String? // BankAdapter.transferId on auto-reconcile
+  description String?
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([type])
+  @@index([bankTxnId])
+}
+
+// =============================================================================
+// SECTION 2 — RBAC stub (WARD's B3 owns final shape; declared here as ports)
+// =============================================================================
+// FORGE declares stubs so Order/Audit FKs resolve. WARD will extend with
+// permission rows, scopes, and ABAC fields. Do not bake business logic against
+// these tables yet — go through WARD's RoleService plugin.
+
+model Role {
+  id          String  @id @default(cuid())
+  name        String  @unique // e.g., "buyer.b2b", "admin.finance", "supplier.lng"
+  description String?
+  isSystem    Boolean @default(false) // system roles cannot be deleted via admin UI
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserRole {
+  userId    String
+  roleId    String
+  grantedAt DateTime @default(now())
+  grantedBy String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+// Permissions = data, not code (per addendum §2 WARD bullet). Middleware
+// reads permission rows; new role = INSERT, no deploy.
+model Permission {
+  id          String  @id @default(cuid())
+  code        String  @unique // e.g., "order.approve", "supplier.assign"
+  description String?
+
+  roles RolePermission[]
+
+  createdAt DateTime @default(now())
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model TwoFactorSecret {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  secret        String // encrypted at-rest via app-level AEAD
+  recoveryCodes String[] // hashed
+  enabled       Boolean   @default(false)
+  enrolledAt    DateTime  @default(now())
+  lastUsedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// UC-A01 + Phase-2 OI-02 admin gates. Polymorphic: subjectType + subjectId
+// keep schema generic so future approval kinds (supplier-onboard, refund,
+// live-payment-mode-switch) reuse it.
+enum ApprovalKind {
+  B2B_SIGNUP
+  SUPPLIER_ONBOARD
+  REFUND
+  LIVE_PAYMENT_MODE_SWITCH
+  QUOTATION_SUSPEND
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model AdminApproval {
+  id          String         @id @default(cuid())
+  kind        ApprovalKind
+  status      ApprovalStatus @default(PENDING)
+  subjectType String // entity name being approved (e.g., "User", "Order")
+  subjectId   String
+  requestedBy String? // user requesting (null when system-initiated)
+  decidedBy   String?
+  decidedAt   DateTime?
+  reason      String?
+  metadata    Json?
+
+  requester User? @relation("ApprovalSubject", fields: [requestedBy], references: [id], onDelete: SetNull)
+  decider   User? @relation("ApprovalDecider", fields: [decidedBy], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind, status])
+  @@index([subjectType, subjectId])
+}
+
+// =============================================================================
+// SECTION 3 — Suppliers, Capacity, Packaging
+// =============================================================================
+
+enum SupplierStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+}
+
+model Supplier {
+  id                String  @id @default(cuid())
+  code              String  @unique // human-readable: "LNG-001"
+  legalName         String
+  contactPersonName String
+  contactPhone      String
+  email             String?
+  addressLine1      String
+  city              String
+  province          String?
+  postalCode        String
+  countryCode       String  @default("TH")
+
+  // Meeting #1 #10: Soraphop runs a "supplier" record for its own products
+  isInternalSoraphop Boolean @default(false)
+
+  status               SupplierStatus @default(PENDING)
+  defaultDailyCapacity Int            @default(3) // 3-5 containers/day baseline
+
+  capacityOverrides SupplierCapacityOverride[]
+  products          Product[]
+  orders            Order[]
+  packagingStock    PackagingInventory[]
+  quotationData     SupplierQuotationData[]
+  claimConfigs      ClaimConfig[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([status])
+  @@index([isInternalSoraphop])
+}
+
+// Per-day capacity override (holiday, surge). Default falls back to
+// Supplier.defaultDailyCapacity when no row matches.
+model SupplierCapacityOverride {
+  id         String   @id @default(cuid())
+  supplierId String
+  date       DateTime @db.Date
+  capacity   Int
+  reason     String?
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, date])
+}
+
+// Meeting #1 #7: dual-actor + min-threshold alert.
+// Stock unit = boxes. Reconcile via UC-A11 (Phase 2). One row per
+// (supplier, packagingType) — type discriminates box size / SKU.
+model PackagingInventory {
+  id               String  @id @default(cuid())
+  supplierId       String
+  packagingType    String // e.g., "box-10kg-durian", "box-5kg-coconut"
+  unitName         String  @default("box")
+  quantityOnHand   Int     @default(0)
+  minThreshold     Int     @default(0)
+  // alertSubscribers shape (zod-validated):
+  //   { adminIds: string[], supplierIds: string[] }
+  alertSubscribers Json?
+  unitValue        Decimal @default(0) @db.Decimal(12, 2) // UC-A23
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([supplierId, packagingType])
+  @@index([quantityOnHand]) // alert query: WHERE quantityOnHand <= minThreshold
+}
+
+// =============================================================================
+// SECTION 4 — Products, Promotions, FX
+// =============================================================================
+
+enum ProductCategory {
+  DURIAN
+  COCONUT
+  GIFT_SET
+  NEW_ARRIVAL
+}
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model Product {
+  id          String          @id @default(cuid())
+  sku         String          @unique
+  name        String
+  nameEn      String?
+  nameZh      String?
+  description String?         @db.Text
+  category    ProductCategory
+  status      ProductStatus   @default(DRAFT)
+
+  // Dual-price (SRS §5)
+  priceB2B Decimal @db.Decimal(12, 2)
+  priceB2C Decimal @db.Decimal(12, 2)
+  currency String  @default("THB")
+
+  unitWeight Decimal? @db.Decimal(8, 2) // kg, used for promotion unit-match
+  unitName   String   @default("kg")
+
+  // Owner: which supplier publishes this. Soraphop products = supplier with
+  // isInternalSoraphop=true (Meeting #1 #10).
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  // Image keys (BlobStorageAdapter). Array index = display order.
+  imageKeys String[]
+
+  // Meeting #1 #9: anti-dump scaffolding. Logic deferred; schema ready.
+  lastEditedAt  DateTime?
+  editLockUntil DateTime?
+
+  promotionLinks          PromotionProductLink[]
+  orderItems              OrderItem[]
+  barcodes                Barcode[]
+  quotationItems          QuotationItem[]
+  specialRequests         SpecialRequest[]       @relation("SpecialRequestProduct")
+  proposedSpecialRequests SpecialRequest[]       @relation("SpecialRequestProposed")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([category, status])
+  @@index([supplierId])
+  @@index([deletedAt])
+}
+
+enum PromotionStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  EXPIRED
+}
+
+// Admin-managed campaign. Meeting #1 #1: products are linked manually via
+// PromotionProductLink — system does NOT auto-match.
+model Promotion {
+  id             String          @id @default(cuid())
+  code           String          @unique
+  title          String
+  titleEn        String?
+  titleZh        String?
+  description    String?         @db.Text
+  status         PromotionStatus @default(DRAFT)
+  startsAt       DateTime
+  endsAt         DateTime
+  bannerImageKey String?
+
+  productLinks PromotionProductLink[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([status, startsAt, endsAt])
+}
+
+// Meeting #1 #1: admin manually picks each product + sets unit constraints.
+// `unitQty` and `unitWeight` are per-link overrides because the same product
+// in different promotions can carry different bundle sizes.
+model PromotionProductLink {
+  id           String   @id @default(cuid())
+  promotionId  String
+  productId    String
+  unitQty      Int?
+  unitWeight   Decimal? @db.Decimal(8, 2)
+  durationDays Int? // bundle valid period override
+  notes        String?
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([promotionId, productId])
+}
+
+// Meeting #1 #3: dual-currency display in checkout. We cache rates from an
+// FxRateAdapter (e.g., ExchangeRateApi, BankFx). `fetchedAt` enables stale
+// detection — UI shows "ประมาณ" so freshness ~minutes is fine.
+model FxRate {
+  id           String   @id @default(cuid())
+  currencyCode String // ISO 4217 (e.g., "CNY", "USD")
+  rateToThb    Decimal  @db.Decimal(18, 6)
+  source       String // adapter identifier (e.g., "exchangerate-api", "scb")
+  fetchedAt    DateTime @default(now())
+
+  @@unique([currencyCode, source, fetchedAt])
+  @@index([currencyCode, fetchedAt(sort: Desc)])
+}
+
+// =============================================================================
+// SECTION 5 — Quotations (with Meeting #1 configurable conditions)
+// =============================================================================
+
+enum QuotationStatus {
+  DRAFT
+  PENDING_BUYER_CONFIRM
+  CONFIRMED
+  EXPIRED
+  CANCELLED
+  SUSPENDED // Meeting #1 #8 — admin suspends supplier-derived quotation
+}
+
+enum QuotationSource {
+  SYSTEM // computed by Soraphop pricing engine
+  SUPPLIER_DERIVED // supplier overrode condition values
+}
+
+model Quotation {
+  id            String          @id @default(cuid())
+  number        String          @unique // human ref, e.g., "Q-2026-04-00001"
+  requesterId   String
+  // Meeting #1 #4: B2C may also request a quotation
+  requesterType ActorType
+  source        QuotationSource @default(SYSTEM)
+  supplierId    String? // present when source=SUPPLIER_DERIVED
+  status        QuotationStatus @default(DRAFT)
+  currency      String          @default("THB")
+  subtotal      Decimal         @default(0) @db.Decimal(14, 2)
+  total         Decimal         @default(0) @db.Decimal(14, 2)
+
+  // Countdown — UC-X04: 5-7 days configurable per quotation
+  expiresAt     DateTime
+  confirmedAt   DateTime?
+  suspendedAt   DateTime?
+  suspendReason String?
+
+  items             QuotationItem[]
+  appliedConditions QuotationAppliedCondition[]
+  order             Order?
+
+  requester User @relation("QuotationRequester", fields: [requesterId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([requesterId, status])
+  @@index([status, expiresAt])
+  @@index([supplierId])
+}
+
+model QuotationItem {
+  id          String  @id @default(cuid())
+  quotationId String
+  productId   String
+  qty         Decimal @db.Decimal(12, 2)
+  unitName    String  @default("kg")
+  unitPrice   Decimal @db.Decimal(12, 2)
+  lineTotal   Decimal @db.Decimal(14, 2)
+  notes       String?
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id])
+
+  @@index([quotationId])
+}
+
+// Meeting #1 #8: dev defines header categories; suppliers override own values.
+// `category` is the "หัวข้อเงื่อนไข" (e.g., "shipping_mode", "min_order_qty",
+// "lead_time_days"). `valueSchema` stores zod schema as JSON so service layer
+// can validate supplier overrides without a code deploy.
+model QuotationCondition {
+  id           String  @id @default(cuid())
+  category     String  @unique
+  label        String
+  labelEn      String?
+  labelZh      String?
+  description  String?
+  valueSchema  Json // zod schema serialized
+  defaultValue Json?
+  isActive     Boolean @default(true)
+
+  supplierOverrides   SupplierQuotationData[]
+  appliedToQuotations QuotationAppliedCondition[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Per-supplier override of a condition. Admin can suspend the supplier's
+// quotation by flipping `isActive` (also drops a SUSPENDED status on
+// downstream Quotation rows via service layer).
+model SupplierQuotationData {
+  id          String  @id @default(cuid())
+  supplierId  String
+  conditionId String
+  value       Json // shape validated against QuotationCondition.valueSchema
+  isActive    Boolean @default(true)
+
+  supplier  Supplier           @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  condition QuotationCondition @relation(fields: [conditionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([supplierId, conditionId])
+}
+
+// Snapshot of which condition values applied at quotation-confirm time.
+// Frozen so audit-trail is reproducible after admin edits a condition later.
+model QuotationAppliedCondition {
+  id           String @id @default(cuid())
+  quotationId  String
+  conditionId  String
+  appliedValue Json
+
+  quotation Quotation          @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  condition QuotationCondition @relation(fields: [conditionId], references: [id])
+
+  @@unique([quotationId, conditionId])
+}
+
+// =============================================================================
+// SECTION 6 — Orders, Payments, Transport
+// =============================================================================
+
+enum OrderStatus {
+  CART
+  PENDING_QUOTATION
+  AWAITING_PAYMENT_1 // 50% deposit
+  PAYMENT_1_VERIFIED
+  ASSIGNED_TO_SUPPLIER
+  PACKING
+  AWAITING_PAYMENT_2 // 20% on container close
+  PAYMENT_2_VERIFIED
+  SHIPPED
+  AT_DESTINATION
+  AWAITING_PAYMENT_3 // 30% (net of claim/box)
+  PAYMENT_3_VERIFIED
+  COMPLETED
+  CANCELLED
+}
+
+// Meeting #1 #2: B2B = mode + port + factors. B2C = mode only.
+// Stored as JSON because shape diverges per actor and OI-01 may add fields.
+// Service-layer zod schema enforces the divergence.
+enum TransportMode {
+  ROAD
+  AIR
+  SEA
+  ROAD_AIR_HYBRID
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  number      String      @unique // "ORD-2026-04-00001"
+  buyerId     String
+  actorType   ActorType // snapshot of buyer type at order time
+  supplierId  String? // assigned by admin (UC-A06); null until assigned
+  quotationId String?     @unique
+  status      OrderStatus @default(CART)
+  currency    String      @default("THB")
+  subtotal    Decimal     @default(0) @db.Decimal(14, 2)
+  total       Decimal     @default(0) @db.Decimal(14, 2)
+
+  // Meeting #1 #2 — transport config divergence
+  transportMode   TransportMode?
+  transportConfig Json? // zod-validated per actorType
+
+  notes String? @db.Text
+
+  buyer     User       @relation(fields: [buyerId], references: [id])
+  supplier  Supplier?  @relation(fields: [supplierId], references: [id])
+  quotation Quotation? @relation(fields: [quotationId], references: [id])
+
+  items      OrderItem[]
+  payments   Payment[]
+  containers Container[]
+  barcodes   Barcode[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([buyerId, status])
+  @@index([supplierId, status])
+  @@index([status, createdAt])
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  orderId   String
+  productId String
+  qty       Decimal @db.Decimal(12, 2)
+  unitName  String  @default("kg")
+  unitPrice Decimal @db.Decimal(12, 2)
+  lineTotal Decimal @db.Decimal(14, 2)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+}
+
+enum PaymentInstallment {
+  ONE // 50%
+  TWO // 20%
+  THREE // 30% (net)
+}
+
+enum PaymentStatus {
+  PENDING_BUYER // awaiting buyer transfer
+  AWAITING_VERIFICATION // bank txn detected, admin to verify
+  VERIFIED
+  REJECTED
+  REFUNDED
+}
+
+enum PaymentMethodKind {
+  WALLET
+  BANK_TRANSFER
+  QR_PROMPTPAY
+  ALIPAY
+  WECHAT_PAY
+  // Meeting #1 OI-02 — additional methods land as plugins; enum extends per
+  // PaymentMethodPlugin registration. Adding a value = no breaking migration.
+}
+
+model Payment {
+  id             String             @id @default(cuid())
+  orderId        String
+  installment    PaymentInstallment
+  expectedAmount Decimal            @db.Decimal(14, 2)
+  paidAmount     Decimal?           @db.Decimal(14, 2)
+  currency       String             @default("THB")
+  method         PaymentMethodKind?
+  status         PaymentStatus      @default(PENDING_BUYER)
+
+  // BankAdapter reconciliation references
+  bankTxnId    String?   @unique
+  bankRef      String? // reference number printed for buyer
+  paidAt       DateTime?
+  verifiedAt   DateTime?
+  verifiedBy   String?
+  rejectedAt   DateTime?
+  rejectReason String?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orderId, installment])
+  @@index([status])
+  @@index([bankTxnId])
+}
+
+// Meeting #1 OI-02: each method = plugin, admin enables/disables via DB.
+// Schema decouples available methods from the PaymentMethodKind enum so admin
+// toggles never require a deploy.
+model PaymentMethodConfig {
+  id          String            @id @default(cuid())
+  kind        PaymentMethodKind @unique
+  displayName String
+  isEnabled   Boolean           @default(false)
+  // Adapter wiring — read by composition root at boot/refresh
+  adapterId   String // matches a PaymentMethodPlugin registration
+  config      Json? // adapter-specific config (sandbox keys, etc.)
+  appliesTo   ActorType[] // which actor types may use it
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// =============================================================================
+// SECTION 7 — Containers, Barcodes, QR Codes
+// =============================================================================
+
+enum ContainerStatus {
+  PLANNED
+  PACKING
+  SEALED
+  IN_TRANSIT
+  AT_DESTINATION
+  INSPECTED
+  CLOSED
+}
+
+model Container {
+  id              String          @id @default(cuid())
+  number          String          @unique // ตู้# (UC-S05)
+  orderId         String
+  status          ContainerStatus @default(PLANNED)
+  defaultBoxCount Int             @default(960) // SRS §7.3 default; configurable
+  actualBoxCount  Int? // filled at seal time
+  sealedAt        DateTime?
+  shippedAt       DateTime?
+  arrivedAt       DateTime?
+
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  qrCodes     QRCode[]
+  inspection  Inspection?
+  certificate Certificate?
+  claims      Claim[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId, status])
+  @@index([status])
+}
+
+// Meeting #1 #6: Barcode FK to Order is REQUIRED — no standalone pool.
+// Distinct from QRCode (per-box traceability inside a container).
+model Barcode {
+  id          String   @id @default(cuid())
+  code        String   @unique // EAN/Code128 payload
+  orderId     String
+  productId   String
+  generatedAt DateTime @default(now())
+  metadata    Json?
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// 960 per container by default. Generated at packing time (UC-S04).
+model QRCode {
+  id          String    @id @default(cuid())
+  containerId String
+  code        String    @unique // payload encoded into QR
+  sequenceNo  Int // 1..N within container
+  generatedAt DateTime  @default(now())
+  scannedAt   DateTime?
+  metadata    Json?
+
+  container Container @relation(fields: [containerId], references: [id], onDelete: Cascade)
+
+  @@unique([containerId, sequenceNo])
+  @@index([containerId])
+}
+
+// =============================================================================
+// SECTION 8 — Inspections, Claims, Certificates (QC at destination)
+// =============================================================================
+
+enum InspectionStatus {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  PASSED_WITH_CLAIM
+  FAILED
+}
+
+model Inspection {
+  id             String           @id @default(cuid())
+  containerId    String           @unique
+  inspectorId    String? // QC user
+  status         InspectionStatus @default(PENDING)
+  damagePercent  Decimal?         @db.Decimal(5, 2) // UC-A22 threshold compare
+  temperatureLog Json? // [{at: ISO, c: number}, ...] (UC-Q06)
+  photoBlobKeys  String[] // QC photos (UC-Q05)
+  notes          String?          @db.Text
+  inspectedAt    DateTime?
+
+  container   Container    @relation(fields: [containerId], references: [id], onDelete: Cascade)
+  claims      Claim[]
+  certificate Certificate?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+enum ClaimStatus {
+  RAISED
+  UNDER_REVIEW
+  ACCEPTED
+  REJECTED
+  APPEALED
+  RESOLVED
+}
+
+model Claim {
+  id           String      @id @default(cuid())
+  inspectionId String
+  containerId  String
+  raisedBy     String? // QC user
+  status       ClaimStatus @default(RAISED)
+  damageQty    Decimal?    @db.Decimal(12, 2)
+  damageValue  Decimal?    @db.Decimal(14, 2)
+  description  String?     @db.Text
+  evidenceKeys String[] // photo blob keys
+  appealReason String?     @db.Text
+
+  inspection Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  container  Container  @relation(fields: [containerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([inspectionId])
+  @@index([containerId, status])
+}
+
+model Certificate {
+  id           String   @id @default(cuid())
+  inspectionId String   @unique
+  containerId  String   @unique
+  number       String   @unique // "CERT-2026-..."
+  issuedAt     DateTime @default(now())
+  issuedBy     String? // QC user id
+  blobKey      String? // signed PDF
+  metadata     Json?
+
+  inspection Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  container  Container  @relation(fields: [containerId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+}
+
+// =============================================================================
+// SECTION 9 — Audit Log + Notifications (cross-cutting)
+// =============================================================================
+
+// WARD's `AuditLogger` plugin writes here by default; ExternalSinkAdapter can
+// double-write to Datadog/Splunk later. Schema is fixed; sinks are swappable.
+
+enum AuditSeverity {
+  INFO
+  NOTICE
+  WARNING
+  CRITICAL
+}
+
+model AuditLog {
+  id         String        @id @default(cuid())
+  occurredAt DateTime      @default(now())
+  severity   AuditSeverity @default(INFO)
+  // event identifier, dotted (e.g., "order.payment.verified")
+  event      String
+  actorId    String? // user who triggered (null = system)
+  actorIp    String?
+  actorUa    String?
+  // polymorphic target
+  targetType String?
+  targetId   String?
+  // before/after diff (sensitive fields redacted by service layer)
+  diff       Json?
+  // adapter that emitted (e.g., "prisma-audit", "datadog-sink")
+  emittedBy  String        @default("prisma-audit")
+  metadata   Json?
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([event, occurredAt])
+  @@index([targetType, targetId])
+  @@index([actorId, occurredAt])
+  @@index([occurredAt])
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+  SMS // Phase 2+
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+  READ
+}
+
+// Notifications are delivered via channel adapters (EmailAdapter,
+// RealtimeAdapter, PushAdapter). One row per (recipient × channel) so retry
+// policy + read state track per channel independently.
+model NotificationDelivery {
+  id           String              @id @default(cuid())
+  recipientId  String
+  channel      NotificationChannel
+  status       NotificationStatus  @default(QUEUED)
+  templateKey  String // e.g., "packaging.low_stock"
+  payload      Json // template variables
+  refType      String?
+  refId        String?
+  sentAt       DateTime?
+  readAt       DateTime?
+  failedAt     DateTime?
+  errorMessage String?
+
+  recipient User @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([recipientId, status])
+  @@index([recipientId, readAt])
+}
+
+// =============================================================================
+// SECTION 10 — SpecialRequest (UC-B08 SAMPLE + UC-B09 CUSTOM, response UC-A18)
+// =============================================================================
+// Not in SRS §5's 14-entity list, but the use cases require persistence.
+// Schema lands now to keep "no breaking migration in Phase 2" (per work-order).
+
+enum SpecialRequestKind {
+  SAMPLE
+  CUSTOM
+}
+
+enum SpecialRequestStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  FULFILLED
+}
+
+model SpecialRequest {
+  id                 String               @id @default(cuid())
+  kind               SpecialRequestKind
+  status             SpecialRequestStatus @default(PENDING)
+  requesterId        String
+  // SAMPLE-only
+  productId          String?
+  // CUSTOM-only
+  productCategory    ProductCategory?
+  desiredSpec        String?              @db.Text
+  targetPrice        Decimal?             @db.Decimal(14, 2)
+  // shared
+  qty                Decimal              @db.Decimal(12, 2)
+  unitName           String               @default("kg")
+  currency           String               @default("THB")
+  expectedDeliveryAt DateTime?
+  notes              String?              @db.Text
+  // SAMPLE shipping address (CUSTOM uses notes)
+  shippingAddress    Json?
+  attachmentBlobKeys String[]             @default([])
+  // admin response (UC-A18)
+  adminResponse      String?              @db.Text
+  proposedProductId  String?
+  proposedPrice      Decimal?             @db.Decimal(14, 2)
+  decidedBy          String?
+  decidedAt          DateTime?
+
+  requester       User     @relation("SpecialRequestRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  product         Product? @relation("SpecialRequestProduct", fields: [productId], references: [id])
+  proposedProduct Product? @relation("SpecialRequestProposed", fields: [proposedProductId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([requesterId, status])
+  @@index([kind, status])
+  @@index([productId])
+}
+
+// =============================================================================
+// SECTION 11 — ClaimConfig (UC-A22 % threshold + UC-A23 box value)
+// =============================================================================
+// Phase-1 surfaces config; Phase-2 (UC-A10/A11/A12) consumes it.
+// Scope = GLOBAL gives a system-wide default; SUPPLIER overrides per-supplier
+// for premium contracts. Service layer resolves: SUPPLIER row first, GLOBAL
+// fallback. Unique on (scope, supplierId) — supplierId NULL for GLOBAL.
+
+enum ClaimConfigScope {
+  GLOBAL
+  SUPPLIER
+}
+
+model ClaimConfig {
+  id                     String           @id @default(cuid())
+  scope                  ClaimConfigScope
+  supplierId             String? // null when scope=GLOBAL
+  damagePercentThreshold Decimal          @default(5) @db.Decimal(5, 2) // UC-A22
+  boxUnitValue           Decimal          @default(0) @db.Decimal(12, 2) // UC-A23
+  currency               String           @default("THB")
+
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scope, supplierId])
+}
